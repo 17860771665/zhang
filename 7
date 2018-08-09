@@ -1,0 +1,160 @@
+import numpy as np
+import math
+import os
+import random
+
+import gym
+
+import cntk as C
+
+env = gym.make('CartPole-v0')
+n_state = env.observation_space.shape[0]
+n_action = env.action_space.n
+
+print('CartPole-v0 environment: %d states, %d actions' % (n_state, n_action))
+reward_target = 195
+epoch_baseline = 100
+reward_discount = 0.99
+
+hidden_size = 64 # hidden layer size
+batch_size = 64
+learning_rate = 0.00025
+
+max_epsilon = 1
+min_epsilon = 0.01
+epsilon_decay = 0.0001
+class Brain:
+    def __init__(self):
+        self.params = {}
+        self.model, self.trainer, self.loss = self._create()
+
+    def _create(self):
+        observation = C.sequence.input_variable(n_state, np.float32, name='s')
+        q_target = C.sequence.input_variable(n_action, np.float32, name='q')
+
+        l1 = C.layers.Dense(hidden_size, activation=C.relu)
+        l2 = C.layers.Dense(n_action)
+        unbound_model = C.layers.Sequential([l1, l2])
+        self.model = unbound_model(observation)
+
+        self.params = dict(W1=l1.W, b1=l1.b, W2=l2.W, b2=l2.b)
+
+        self.loss = C.reduce_mean(C.square(self.model-q_target), axis=0)
+        meas = C.reduce_mean(C.square(self.model-q_target), axis=0)
+
+        lr_schedule = C.learning_rate_schedule(learning_rate, C.UnitType.minibatch)
+        learner = C.sgd(self.model.parameters,
+                        lr_schedule,
+                        gradient_clipping_threshold_per_sample=10)
+
+        progress_printer = C.logging.ProgressPrinter(500)
+        self.trainer = C.Trainer(self.model, (self.loss, meas), learner, progress_printer)
+
+        return self.model, self.trainer, self.loss
+
+    def train(self, x, y):
+        arguments = dict(zip(self.loss.arguments, [x,y]))
+        updated, results = self.trainer.train_minibatch(arguments, outputs=[self.loss.output])
+
+    def predict(self, s):
+        return self.model.eval([s])
+    
+class Memory: # stored as ( s, a, r, s_ )
+    samples = []
+
+    def __init(self):
+        pass
+
+    def add(self, sample):
+        self.samples.append(sample)
+
+    def sample(self, n):
+        n = min(n, len(self.samples))
+        return random.sample(self.samples, n)
+class Agent:
+    steps = 0
+    epsilon = max_epsilon
+
+    def __init__(self):
+        self.brain = Brain()
+        self.memory = Memory()
+
+    def act(self, s):
+        if random.random() < self.epsilon:
+            return random.randint(0, n_action-1)
+        else:
+            return np.argmax(self.brain.predict(s))
+
+    def observe(self, sample): # in (s, a, r, s_) format
+        self.memory.add(sample)
+        self.steps += 1
+        self.epsilon = min_epsilon + (max_epsilon - min_epsilon) * math.exp(-epsilon_decay * self.steps)
+
+    def replay(self):
+        batch = self.memory.sample(batch_size)
+
+        no_state = np.zeros(n_state)
+
+        states = np.array([ o[0] for o in batch ], dtype=np.float32)
+        states_ = np.array([ (no_state if o[3] is None else o[3]) for o in batch ], dtype=np.float32)
+
+        p = self.brain.predict(states)
+        p_ = self.brain.predict((states_))
+
+        x = np.zeros((len(batch), n_state)).astype(np.float32)
+        y = np.zeros((len(batch), n_action)).astype(np.float32)
+
+        for i in range(len(batch)):
+            s, a, r, s_ = batch[i]
+
+            t = p[0][i] # CNTK: [0] because of sequence dimension
+            if s_ is None:
+                t[a] = r
+            else:
+                t[a] = r + reward_discount * np.amax(p_[0][i])
+
+            x[i] = s
+            y[i] = t
+
+        self.brain.train(x, y)
+        
+def run(agent):
+    s = env.reset()
+    R = 0
+
+    while True:
+        env.render()
+
+        a = agent.act(s.astype(np.float32))
+        s_, r, done, info = env.step(a)
+
+        if done:
+            s_ = None
+
+        agent.observe((s, a, r, s_))
+        agent.replay()
+
+        s = s_
+        R += r
+
+        if done:
+            return R
+
+
+agent = Agent()
+
+epoch = 0
+reward_sum = 0
+while epoch < 30000:
+    reward = run(agent)
+    reward_sum += reward
+    epoch += 1
+    if epoch % epoch_baseline == 0:
+        print('Epoch %d, average reward is %f, memory size is %d'
+              % (epoch, reward_sum / epoch_baseline, len(agent.memory.samples)))
+
+        if reward_sum / epoch_baseline > reward_target:
+            print('Task solved in %d epoch' % epoch)
+            break
+
+        reward_sum = 0
